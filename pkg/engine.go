@@ -1,18 +1,22 @@
 package pkg
+
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"golang.org/x/sync/errgroup"
 )
 
-type ModelType string  
+type ModelType string
 
 const (
 	ModelHighCost ModelType = "hc"
-	ModelLowCost ModelType = "lc"
+	ModelLowCost  ModelType = "lc"
 )
 
 func (m ModelType) IsValid() bool {
@@ -23,7 +27,7 @@ type GenType string
 
 const (
 	GenTypeDetailed GenType = "d"
-	GenTypeRough GenType = "r"
+	GenTypeRough    GenType = "r"
 )
 
 func (g GenType) IsValid() bool {
@@ -31,57 +35,72 @@ func (g GenType) IsValid() bool {
 }
 
 type EngineConfig struct {
-	model ModelType //选择何种模型生成方案(High Cost/Low cost)
-	gentype GenType //是否生成详细剧本
-	num int //生成的剧本数量
-	pattern string //正则表达式，用于标记章节位置，例如 `^第[一二三四五六七八九十百千]+章`
-	path string //小说内容存储的位置
-	savePath string //生成剧本的存储位置
+	Model     ModelType
+	GenType   GenType
+	NumScript int
+	Pattern   string
+	FilePath  string
+	SaveDir   string
 }
 
 type Engine struct {
-	config *EngineConfig
+	config     *EngineConfig
+	llmClient  *LLMClient
+	taskStore  *TaskStore
+	maxWorkers int
 }
 
-func NewEngineConfig(model, gentype, pattern, path, savePath string, numScript int) (*EngineConfig, error) {
+func NewEngineConfig(model, gentype, pattern, filePath, saveDir string, numScript int) (*EngineConfig, error) {
 	m := ModelType(model)
 	if !m.IsValid() {
-		return nil, errors.New("Invalid model type: " + model)
+		return nil, errors.New("invalid model type: " + model)
 	}
 	g := GenType(gentype)
 	if !g.IsValid() {
-		return nil, errors.New("Invalid generation type: " + gentype)
+		return nil, errors.New("invalid generation type: " + gentype)
 	}
-	ec := &EngineConfig{
-		model: m,
-		pattern: pattern,
-		gentype: g,
-		num: numScript,
-		path: path,
-		savePath: savePath,
+	// Validate file path is within allowed directories
+	cleaned := filepath.Clean(filePath)
+	if strings.Contains(cleaned, "..") {
+		return nil, errors.New("invalid file path")
 	}
-	return ec, nil
-} 
+	return &EngineConfig{
+		Model:     m,
+		GenType:   g,
+		NumScript: numScript,
+		Pattern:   pattern,
+		FilePath:  filePath,
+		SaveDir:   saveDir,
+	}, nil
+}
 
-func NewEngine(config *EngineConfig) (*Engine, error) {
+func NewEngine(config *EngineConfig, llmClient *LLMClient, taskStore *TaskStore, maxWorkers int) (*Engine, error) {
 	if config == nil {
 		return nil, errors.New("config cannot be nil")
 	}
-	if config.path == "" {
-		return nil, errors.New("path cannot be empty")
+	if config.FilePath == "" {
+		return nil, errors.New("file path cannot be empty")
 	}
-	engine := &Engine{
-		config: config,
+	if llmClient == nil {
+		return nil, errors.New("LLM client cannot be nil")
 	}
-	return engine, nil
+	if _, err := os.Stat(config.FilePath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("file not found: %s", config.FilePath)
+	}
+	return &Engine{
+		config:     config,
+		llmClient:  llmClient,
+		taskStore:  taskStore,
+		maxWorkers: maxWorkers,
+	}, nil
 }
 
-func GenSingle(chapterNum int, chapterContent string, gentype GenType, baseUrl, modelName, apiKey string) (string, error) {
-	var s int
+func genSingle(ctx context.Context, client *LLMClient, episodeNum int, chapterContent string, gentype GenType) (string, error) {
+	var maxTokens int
 	if gentype == GenTypeDetailed {
-		s = 1000
+		maxTokens = 1000
 	} else {
-		s = 500
+		maxTokens = 500
 	}
 	prompt := fmt.Sprintf(`请将以下小说片段转换为%d字以内的电视剧剧本，需要详细还原原小说中的细节。要求：
 
@@ -115,21 +134,12 @@ CC(O.S.)：我这是怎么了？
 原文
 %s
 
-/no_think`, s, chapterNum, chapterNum, chapterContent)
-	config := CompletionConfig{
-		BaseURL: baseUrl,
-		ModelName: modelName,
-		APIKey: apiKey,
-		Prompt: prompt,
-	}
-	result, err := ChatCompletion(config)
-	if err != nil {
-		return "", err
-	}
-	return result, nil
+/no_think`, maxTokens, episodeNum, episodeNum, chapterContent)
+
+	return client.ChatCompletion(ctx, prompt)
 }
 
-func SaveScript(savePath, content string, index int) error {
+func saveScript(savePath, content string, index int) error {
 	thinkRegex := regexp.MustCompile(`(?s)<think>.*?</think>`)
 	cleanedContent := thinkRegex.ReplaceAllString(content, "")
 	cleanedContent = strings.ReplaceAll(cleanedContent, "*", "")
@@ -143,51 +153,85 @@ func SaveScript(savePath, content string, index int) error {
 		return replacement
 	})
 	if err := os.WriteFile(savePath, []byte(result), 0644); err != nil {
-		return fmt.Errorf("保存文件失败: %w", err)
+		return fmt.Errorf("failed to save script: %w", err)
 	}
 	return nil
 }
 
-func (e *Engine) GenerateScript() error {
+// GenerateScriptAsync starts script generation in the background and returns a task ID.
+func (e *Engine) GenerateScriptAsync(ctx context.Context, taskID string) {
+	total := e.config.NumScript
+	e.taskStore.UpdateStatus(taskID, TaskStatusRunning, 0, "")
+
+	err := e.generateScriptInternal(ctx, taskID, total)
+	if err != nil {
+		e.taskStore.UpdateStatus(taskID, TaskStatusFailed, 0, err.Error())
+		return
+	}
+	e.taskStore.UpdateStatus(taskID, TaskStatusCompleted, total, "")
+	e.taskStore.SetSaveDir(taskID, e.config.SaveDir)
+}
+
+func (e *Engine) generateScriptInternal(ctx context.Context, taskID string, total int) error {
 	readerEngine := NewDocumentReaderEngine()
-	content, err := readerEngine.ReadDocument(e.config.path)
+	content, err := readerEngine.ReadDocument(e.config.FilePath)
 	if err != nil {
-		return fmt.Errorf("failed to read document: %v", err)
+		return fmt.Errorf("failed to read document: %w", err)
 	}
-	chapters, err := SplitText(content, e.config.pattern)
+
+	chapters, err := SplitText(content, e.config.Pattern)
 	if err != nil {
-		return fmt.Errorf("failed to split text: %v", err)
+		return fmt.Errorf("failed to split text: %w", err)
 	}
-	bins, err := CalBins(len(chapters), e.config.num)
+
+	bins, err := CalBins(len(chapters), e.config.NumScript)
 	if err != nil {
-		return fmt.Errorf("failed to calculate bins: %v", err)
+		return fmt.Errorf("failed to calculate bins: %w", err)
 	}
-	var baseUrl, modelName, apiKey string
-	if e.config.model == ModelLowCost {
-		baseUrl = "http://192.168.11.218:8192/v1"
-		modelName = "novel"
-		apiKey = "None"
-		// only for test
-	} else {
-		//to be implemented when high cost model is available
+
+	mergedChapters := MergeChapter(bins, chapters)
+	if len(mergedChapters) != e.config.NumScript {
+		return fmt.Errorf("merged chapters count mismatch: %d != %d", len(mergedChapters), e.config.NumScript)
 	}
-	now := 0
-	for i, bin := range bins {
-		var result string
-		result = ""
-		for j := 0; j < bin; j++ {
-			response, err := GenSingle(i+1, chapters[now], e.config.gentype, baseUrl, modelName, apiKey)
-			if err != nil {
-				return fmt.Errorf("failed to generate script for chapter %d: %w", now+1, err)
+
+	g, ctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, e.maxWorkers)
+	results := make([]string, len(mergedChapters))
+
+	for i, merged := range mergedChapters {
+		i, merged := i, merged
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
 			}
-			result += response + "\n"
-			now += 1
-		}
-		fullPath := filepath.Join(e.config.savePath, fmt.Sprintf("script_%02d.txt", i+1))
-		err := SaveScript(fullPath, result, i+1)
-		if err != nil {
-			return fmt.Errorf("failed to save script %d: %w", i+1, err)
+			defer func() { <-sem }()
+
+			result, err := genSingle(ctx, e.llmClient, i+1, merged, e.config.GenType)
+			if err != nil {
+				return fmt.Errorf("episode %d: %w", i+1, err)
+			}
+			results[i] = result
+			e.taskStore.UpdateStatus(taskID, TaskStatusRunning, i+1, "")
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(e.config.SaveDir, 0755); err != nil {
+		return fmt.Errorf("failed to create save directory: %w", err)
+	}
+
+	for i, result := range results {
+		fullPath := filepath.Join(e.config.SaveDir, fmt.Sprintf("script_%02d.txt", i+1))
+		if err := saveScript(fullPath, result, i+1); err != nil {
+			return fmt.Errorf("failed to save episode %d: %w", i+1, err)
 		}
 	}
+
 	return nil
 }

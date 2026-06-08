@@ -2,17 +2,22 @@ package pkg
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 	"path/filepath"
+	"strings"
+
 	"github.com/gin-gonic/gin"
-	"mime/multipart"
 	"github.com/google/uuid"
+	"mime/multipart"
 )
 
-const (
-	MaxUploadSize = 100 << 20
-)
+const MaxUploadSize = 100 << 20
+
+var allowedExtensions = map[string]bool{
+	".docx": true,
+	".txt":  true,
+	".doc":  true,
+}
 
 type UploadResponse struct {
 	Success   bool     `json:"success"`
@@ -26,11 +31,7 @@ type Uploader struct {
 }
 
 func NewUploader(tempDir string) *Uploader {
-	log.Printf("文件将保存到临时目录: %s", tempDir)
-	
-	return &Uploader{
-		tempDir: tempDir,
-	}
+	return &Uploader{tempDir: tempDir}
 }
 
 func (u *Uploader) UploadSingleFile(c *gin.Context) {
@@ -38,25 +39,32 @@ func (u *Uploader) UploadSingleFile(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusBadRequest, UploadResponse{
 			Success: false,
-			Message: "获取文件失败: " + err.Error(),
+			Message: "failed to read uploaded file: " + err.Error(),
+		})
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(file.Filename))
+	if !allowedExtensions[ext] {
+		c.JSON(http.StatusBadRequest, UploadResponse{
+			Success: false,
+			Message: fmt.Sprintf("unsupported file type: %s", ext),
 		})
 		return
 	}
 
 	savedPath, err := u.saveFile(c, file)
 	if err != nil {
-		log.Printf("保存文件失败: %v", err)
 		c.JSON(http.StatusInternalServerError, UploadResponse{
 			Success: false,
-			Message: "保存文件失败: " + err.Error(),
+			Message: "failed to save file: " + err.Error(),
 		})
 		return
 	}
 
-	log.Printf("文件 %s 上传成功: %s", file.Filename, savedPath)
 	c.JSON(http.StatusOK, UploadResponse{
 		Success:   true,
-		Message:   "文件上传成功",
+		Message:   "file uploaded successfully",
 		Files:     []string{file.Filename},
 		SavedPath: savedPath,
 	})
@@ -67,10 +75,8 @@ func (u *Uploader) saveFile(c *gin.Context, file *multipart.FileHeader) (string,
 	ext := filepath.Ext(file.Filename)
 	newFileName := fmt.Sprintf("%s%s", id, ext)
 	savedPath := filepath.Join(u.tempDir, newFileName)
-	err := c.SaveUploadedFile(file, savedPath)
-	if err != nil {
+	if err := c.SaveUploadedFile(file, savedPath); err != nil {
 		return "", err
 	}
-	
 	return savedPath, nil
 }
